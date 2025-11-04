@@ -1,179 +1,171 @@
+
 import express from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { authenticateToken } from '../middleware/auth.js';
-import prisma from '../prisma/client.js';
+import { v4 as uuidv4 } from 'uuid';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const router = express.Router();
 
-// Middleware to check auth before any upload endpoint
-router.use(authenticateToken);
+// Store active upload sessions
+const uploadSessions = new Map();
 
-const completeStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const { roomId, userId } = req.query;
+// 🎯 Step 1: Initialize upload session
+router.post('/init-session', authenticateToken, async (req, res) => {
+  try {
+    const { roomId, userId, totalSize, totalChunks } = req.body;
+    
+    const sessionId = uuidv4();
     const uploadPath = path.join(__dirname, '..', 'uploads', roomId, userId);
     
-    console.log(`✅ Directory ready: ${uploadPath}`);
+    // Create directory
     fs.mkdirSync(uploadPath, { recursive: true });
-    cb(null, uploadPath);
-  },
-  filename: (req, file, cb) => {
-    const { userId } = req.query;
-    const filename = `${userId}.webm`; // Single complete file
-    console.log(`📝 Saving as: ${filename}`);
-    cb(null, filename);
-  }
-});
-
-const uploadComplete = multer({ 
-  storage: completeStorage,
-  limits: { fileSize: 500 * 1024 * 1024 } // 500MB limit
-});
-
-// Debug middleware
-router.use('/chunk', (req, res, next) => {
-  console.log('\n========================================');
-  console.log('INCOMING REQUEST TO /api/upload/chunk');
-  console.log('User:', req.user.username);
-  console.log('Full URL:', req.protocol + '://' + req.get('host') + req.originalUrl);
-  console.log('req.query:', JSON.stringify(req.query));
-  console.log('========================================\n');
-  next();
-});
-
-router.post('/complete', uploadComplete.single('video'), async (req, res) => {
-  try {
-    const { roomId, userId, userName } = req.query;
     
-    if (!req.file) {
-      return res.status(400).json({ error: 'No video file provided' });
-    }
-
-    const fileSize = req.file.size;
-    console.log(`✅ Complete video uploaded: ${userName}`);
-    console.log(`📏 File size: ${(fileSize / 1024 / 1024).toFixed(2)} MB`);
-
+    // Store session info
+    uploadSessions.set(sessionId, {
+      roomId,
+      userId,
+      uploadPath,
+      totalChunks,
+      totalSize,
+      receivedChunks: [],
+      createdAt: Date.now()
+    });
+    
+    console.log(`✅ Upload session created: ${sessionId}`);
+    console.log(`   Total size: ${(totalSize / 1024 / 1024).toFixed(2)} MB`);
+    console.log(`   Total chunks: ${totalChunks}`);
+    
     res.json({ 
       success: true, 
-      message: 'Video uploaded successfully',
-      fileSize 
+      sessionId 
     });
     
   } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({ error: 'Upload failed' });
+    console.error('❌ Session init error:', error);
+    res.status(500).json({ error: 'Failed to initialize session' });
   }
 });
 
-const storage = multer.diskStorage({
+// 🎯 Step 2: Upload individual chunks
+// FIX: Get sessionId from query params, not body
+const chunkStorage = multer.diskStorage({
   destination: (req, file, cb) => {
-    console.log('[Multer Destination] Starting...');
+    const { sessionId } = req.query; // ✅ Use query params
+    const session = uploadSessions.get(sessionId);
     
-    const roomId = req.query.roomId;
-    const userId = req.query.userId;
-    
-    // Verify userId matches authenticated user
-    if (userId !== req.user.id) {
-      console.error('❌ User ID mismatch - potential security issue');
-      return cb(new Error('Unauthorized: User ID mismatch'));
+    if (!session) {
+      console.error(`❌ Invalid session: ${sessionId}`);
+      return cb(new Error('Invalid session'));
     }
     
-    if (!roomId || !userId) {
-      console.error('❌ Missing roomId or userId');
-      return cb(new Error('Missing roomId or userId'));
-    }
-    
-    const uploadDir = path.join(__dirname, '..', 'uploads', roomId, userId);
-    
-    try {
-      fs.mkdirSync(uploadDir, { recursive: true });
-      console.log(`✅ Directory ready: ${uploadDir}`);
-      cb(null, uploadDir);
-    } catch (err) {
-      console.error('❌ Error creating directory:', err);
-      cb(err);
-    }
+    cb(null, session.uploadPath);
   },
   filename: (req, file, cb) => {
-    const chunkIndex = req.query.chunkIndex || '0';
-    const filename = `chunk_${chunkIndex}.webm`;
-    console.log(`📝 Saving as: ${filename}`);
-    cb(null, filename);
+    const { chunkIndex } = req.query; // ✅ Use query params
+    cb(null, `chunk_${chunkIndex}.webm`);
   }
 });
 
-const upload = multer({ 
-  storage,
-  limits: { fileSize: 100 * 1024 * 1024 }
+const uploadChunk = multer({ 
+  storage: chunkStorage,
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB per chunk
 });
 
-/**
- * Upload chunk endpoint (Protected)
- */
-router.post('/chunk', upload.single('chunk'), async (req, res) => {
+router.post('/chunk', authenticateToken, uploadChunk.single('chunk'), async (req, res) => {
   try {
-    const { roomId, userId, userName, chunkIndex } = req.query;
+    const { sessionId, chunkIndex, totalChunks } = req.query; // ✅ Use query params
     
-    // Security: Verify userId matches authenticated user
-    if (userId !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        error: 'Unauthorized: Cannot upload chunks for other users'
-      });
+    const session = uploadSessions.get(sessionId);
+    
+    if (!session) {
+      return res.status(400).json({ error: 'Invalid session' });
     }
     
-    console.log(`✅ Chunk ${chunkIndex} uploaded by ${req.user.username}`);
-    console.log(`📏 File size: ${req.file.size} bytes`);
+    // Mark chunk as received
+    session.receivedChunks.push(parseInt(chunkIndex));
     
-    res.json({
-      success: true,
-      message: 'Chunk uploaded successfully',
-      chunkIndex: parseInt(chunkIndex),
-      fileSize: req.file.size,
-      filePath: req.file.path
-    });
-  } catch (error) {
-    console.error('Chunk upload error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to upload chunk'
-    });
-  }
-});
-
-/**
- * Finalize recording endpoint (Protected)
- */
-router.post('/finalize', async (req, res) => {
-  try {
-    const { roomId, userId, userName } = req.body;
-    
-    // Security: Verify userId matches authenticated user
-    if (userId !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        error: 'Unauthorized: Cannot finalize recordings for other users'
-      });
-    }
-    
-    console.log(`✅ Recording finalized by ${req.user.username}`);
+    console.log(`✅ Chunk ${chunkIndex}/${totalChunks} uploaded (Session: ${sessionId.slice(0, 8)})`);
     
     res.json({ 
       success: true,
-      message: 'Recording finalized successfully'
+      chunkIndex: parseInt(chunkIndex),
+      received: session.receivedChunks.length,
+      total: session.totalChunks
     });
+    
   } catch (error) {
-    console.error('Finalize error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to finalize recording'
+    console.error('❌ Chunk upload error:', error);
+    res.status(500).json({ error: 'Chunk upload failed' });
+  }
+});
+
+// 🎯 Step 3: Finalize upload (reassemble chunks)
+router.post('/finalize-session', authenticateToken, async (req, res) => {
+  try {
+    const { sessionId, roomId, userId } = req.body;
+    
+    const session = uploadSessions.get(sessionId);
+    
+    if (!session) {
+      return res.status(400).json({ error: 'Invalid session' });
+    }
+    
+    console.log(`🔗 Finalizing upload session: ${sessionId.slice(0, 8)}`);
+    console.log(`   Received chunks: ${session.receivedChunks.length}/${session.totalChunks}`);
+    
+    // Verify all chunks received
+    if (session.receivedChunks.length !== session.totalChunks) {
+      return res.status(400).json({ 
+        error: 'Missing chunks',
+        received: session.receivedChunks.length,
+        expected: session.totalChunks
+      });
+    }
+    
+    // Sort chunks
+    const sortedChunks = session.receivedChunks.sort((a, b) => a - b);
+    
+    // Reassemble video
+    const outputPath = path.join(session.uploadPath, `${userId}.webm`);
+    const writeStream = fs.createWriteStream(outputPath);
+    
+    for (const chunkIndex of sortedChunks) {
+      const chunkPath = path.join(session.uploadPath, `chunk_${chunkIndex}.webm`);
+      const chunkData = fs.readFileSync(chunkPath);
+      writeStream.write(chunkData);
+      
+      // Delete chunk after merging
+      fs.unlinkSync(chunkPath);
+    }
+    
+    writeStream.end();
+    
+    await new Promise((resolve, reject) => {
+      writeStream.on('finish', resolve);
+      writeStream.on('error', reject);
     });
+    
+    const stats = fs.statSync(outputPath);
+    console.log(`✅ Video reassembled: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+    
+    // Clean up session
+    uploadSessions.delete(sessionId);
+    
+    res.json({ 
+      success: true,
+      message: 'Upload finalized',
+      fileSize: stats.size
+    });
+    
+  } catch (error) {
+    console.error('❌ Finalization error:', error);
+    res.status(500).json({ error: 'Failed to finalize upload' });
   }
 });
 

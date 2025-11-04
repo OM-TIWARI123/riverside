@@ -27,7 +27,7 @@ model User {
 model Recording {
   id        String   @id @default(cuid())
   userId    String
-  roomId    String   @unique
+  roomId    String   
   title     String   @default("Untitled Recording")
   videoUrl  String?
   duration  Int?     // Duration in seconds
