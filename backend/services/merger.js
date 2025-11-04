@@ -19,42 +19,44 @@ export async function mergeUserChunks(roomId, userId) {
     
     fs.mkdirSync(outputDir, { recursive: true });
     
-    // 🎯 Look for single complete file
     const videoFile = path.join(uploadsDir, `${userId}.webm`);
     
-    console.log(`🔍 Looking for: ${videoFile}`);
-    
     if (!fs.existsSync(videoFile)) {
-      return reject(new Error(`Video file not found: ${videoFile}`));
+      return reject(new Error(`Video file not found`));
     }
 
     const stats = fs.statSync(videoFile);
-    console.log(`🔧 Processing video for user ${userId}`);
+    console.log(`🔧 Processing HIGH QUALITY video for user ${userId}`);
     console.log(`📦 File size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
-    
-    if (stats.size === 0) {
-      return reject(new Error(`Video file is empty`));
-    }
     
     const outputFile = path.join(outputDir, `${userId}.mp4`);
     
     try {
-      console.log(`🎬 Converting WebM to MP4...`);
+      console.log(`🎬 Converting with optimized high-quality settings...`);
       
-      // 🎯 Simple conversion - no concatenation needed!
+      // 🎯 BALANCED: High quality + Reasonable speed
       await execPromise(
         `ffmpeg -y -i "${videoFile}" ` +
-        `-c:v libx264 -preset medium -crf 23 ` +
-        `-r 30 ` +
-        `-c:a aac -ar 48000 -ac 2 -b:a 192k ` +
-        `-movflags +faststart ` +
+        `-c:v libx264 ` +
+        `-preset faster ` +              // Faster than 'medium', better than 'ultrafast'
+        `-crf 20 ` +                     // High quality (18=visually lossless, 23=default, 20=sweet spot)
+        `-profile:v high ` +             // H.264 High Profile for better compression
+        `-level 4.2 ` +                  // Modern compatibility
+        `-pix_fmt yuv420p ` +            // Maximum compatibility
+        `-r 30 ` +                       // Keep 30fps
+        `-c:a aac -ar 48000 -ac 2 -b:a 192k ` +  // High quality audio
+        `-movflags +faststart ` +        // Web optimization
+        `-threads 0 ` +                  // Use all available threads
         `"${outputFile}"`
       );
       
-      console.log(`✅ Video converted: ${outputFile}`);
+      console.log(`✅ HIGH QUALITY video converted`);
       
       const duration = await getVideoDuration(outputFile);
       console.log(`⏱️ Duration: ${duration.toFixed(2)}s`);
+      
+      const outputStats = fs.statSync(outputFile);
+      console.log(`📦 Output size: ${(outputStats.size / 1024 / 1024).toFixed(2)} MB`);
       
       resolve(outputFile);
       
@@ -167,20 +169,16 @@ export async function mergeSideBySide(roomId, userIds) {
   });
 }
 
-export async function processRoom(roomId, userIds) {
-  console.log(`🚀 Starting processing for room ${roomId}`);
+// Update the processRoom function signature
+export async function processRoom(roomId, userIds, recordingId) {
+  console.log(`🚀 Starting processing for room ${roomId}, recording ${recordingId}`);
   
   try {
-    // Step 1: Merge individual user chunks with DURATION FIX
+    // Step 1: Merge individual user chunks
     const userVideos = [];
     for (const userId of userIds) {
       console.log(`🔧 Merging chunks for user ${userId}`);
       const videoPath = await mergeUserChunks(roomId, userId);
-      
-      // Verify each user video duration
-      const duration = await getVideoDuration(videoPath);
-      console.log(`⏱️ User ${userId} video duration: ${duration.toFixed(2)}s`);
-      
       userVideos.push(videoPath);
     }
     
@@ -199,7 +197,7 @@ export async function processRoom(roomId, userIds) {
     const finalDuration = await getVideoDuration(finalVideoPath);
     console.log(`✅ Final video created: ${finalVideoPath} (${finalDuration.toFixed(2)}s)`);
     
-    // Rest of your existing processRoom code remains the same...
+    // Upload to S3
     const timestamp = Date.now();
     const s3Key = `recordings/${roomId}/final-${timestamp}.mp4`;
     
@@ -209,8 +207,9 @@ export async function processRoom(roomId, userIds) {
     
     const s3Url = await uploadToS3(finalVideoPath, s3Key, 'video/mp4');
     
+    // 🎯 FIX: Update using recordingId (the unique id)
     const recording = await prisma.recording.update({
-      where: { roomId },
+      where: { id: recordingId },
       data: {
         videoUrl: s3Url,
         status: 'completed',
@@ -221,6 +220,7 @@ export async function processRoom(roomId, userIds) {
     console.log(`✅ Recording updated in database`);
     console.log(`🔗 Video URL: ${s3Url}`);
     
+    // Cleanup
     if (process.env.NODE_ENV === 'production') {
       const uploadDir = path.join(__dirname, '..', 'uploads', roomId);
       fs.rmSync(uploadDir, { recursive: true, force: true });
@@ -228,12 +228,14 @@ export async function processRoom(roomId, userIds) {
     }
     
     return recording;
+    
   } catch (error) {
     console.error('❌ Processing error:', error);
     
     try {
+      // 🎯 FIX: Update using recordingId
       await prisma.recording.update({
-        where: { roomId },
+        where: { id: recordingId },
         data: { status: 'failed' },
       });
     } catch (dbError) {

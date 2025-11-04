@@ -24,7 +24,7 @@ const app = express();
 const server = createServer(app);
 const allowedOrigins = process.env.FRONTEND_URL 
   ? [process.env.FRONTEND_URL, 'http://localhost:5173']
-  : ['http://localhost:5173'];
+  : ['http://localhost:5173','http://192.168.1.38:5173'];
 const io = new Server(server, {
   cors: {
     origin: allowedOrigins,
@@ -294,122 +294,122 @@ io.on('connection', (socket) => {
   });
 
   socket.on('stop-recording', async ({ roomId }) => {
-    console.log(` Stop recording for room ${roomId} by ${user.username}`);
+  console.log(`⏹️ Stop recording for room ${roomId} by ${user.username}`);
+  
+  if (user.isGuest) {
+    socket.emit('error', { message: 'Guests cannot stop recording' });
+    return;
+  }
+  
+  io.to(roomId).emit('recording-stop-sync');
+  
+  const room = rooms.get(roomId);
+  
+  if (!room) {
+    console.error(`⚠️ Room ${roomId} not found`);
+    socket.emit('error', { message: 'Room not found' });
+    return;
+  }
+  
+  // Create recording entry
+  let recording;
+  try {
+    recording = await prisma.recording.create({
+      data: {
+        userId: user.id,
+        roomId,
+        title: `Recording - ${new Date().toLocaleString()}`,
+        status: 'processing',
+        videoUrl: null,
+      }
+    });
     
-    if (user.isGuest) {
-      socket.emit('error', { message: 'Guests cannot stop recording' });
-      return;
-    }
+    console.log(`📝 Created recording: ${recording.id}`);
     
-    io.to(roomId).emit('recording-stop-sync');
+    io.to(roomId).emit('recording-processing', {
+      recordingId: recording.id,
+      message: 'Processing your recording...'
+    });
     
-    const room = rooms.get(roomId);
-    
-    if (!room) {
-      console.error(` Room ${roomId} not found`);
-      socket.emit('error', { message: 'Room not found' });
-      return;
-    }
-    
-    // Create recording entry
-    let recording;
+  } catch (error) {
+    console.error('❌ Failed to create recording:', error);
+    io.to(roomId).emit('video-error', {
+      error: 'Failed to create recording entry'
+    });
+    return;
+  }
+  
+  // Wait for uploads to complete
+  console.log(`⏳ Waiting 15 seconds for video uploads to complete...`);
+  
+  setTimeout(async () => {
     try {
-      recording = await prisma.recording.create({
-        data: {
-          userId: user.id,
-          roomId,
-          title: `Recording - ${new Date().toLocaleString()}`,
-          status: 'processing',
-          videoUrl: null,
-        }
-      });
+      console.log(`🎬 Starting video processing for room ${roomId}`);
       
-      console.log(` Created recording: ${recording.id}`);
+      const roomDir = path.join(__dirname, 'uploads', roomId);
       
-      io.to(roomId).emit('recording-processing', {
-        recordingId: recording.id,
-        message: 'Processing your recording...'
-      });
+      if (!fs.existsSync(roomDir)) {
+        throw new Error(`Room directory not found`);
+      }
       
-    } catch (error) {
-      console.error('❌ Failed to create recording:', error);
-      io.to(roomId).emit('video-error', {
-        error: 'Failed to create recording entry'
-      });
-      return;
-    }
-    
-    // Wait for chunks to finish uploading
-    setTimeout(async () => {
-      try {
-        console.log(`🎬 Starting video processing for room ${roomId}`);
+      const allDirs = fs.readdirSync(roomDir, { withFileTypes: true })
+        .filter(dirent => dirent.isDirectory())
+        .filter(dirent => dirent.name !== 'merged')
+        .map(dirent => dirent.name);
+      
+      console.log(`📁 Found ${allDirs.length} user directories`);
+      
+      const validUserIds = [];
+      for (const userId of allDirs) {
+        const userPath = path.join(roomDir, userId);
+        const videoFile = path.join(userPath, `${userId}.webm`);
         
-        const roomDir = path.join(__dirname, 'uploads', roomId);
-        
-        if (!fs.existsSync(roomDir)) {
-          throw new Error(`Room directory not found`);
-        }
-        
-        const allDirs = fs.readdirSync(roomDir, { withFileTypes: true })
-          .filter(dirent => dirent.isDirectory())
-          .filter(dirent => dirent.name !== 'merged')
-          .map(dirent => dirent.name);
-        
-        console.log(`📁 Found ${allDirs.length} user directories`);
-        
-        const validUserIds = [];
-        for (const userId of allDirs) {
-          const userPath = path.join(roomDir, userId);
-          const videoFile = path.join(userPath, `${userId}.webm`);
-          if (fs.existsSync(videoFile)) {
+        if (fs.existsSync(videoFile)) {
           const stats = fs.statSync(videoFile);
           console.log(`📂 User ${userId}: ${(stats.size / 1024 / 1024).toFixed(2)} MB video`);
           
           if (stats.size > 0) {
             validUserIds.push(userId);
-          } else {
-            console.warn(`⚠️ User ${userId}: Video file is empty`);
           }
-        } else {
-          console.warn(`⚠️ User ${userId}: No video file found`);
         }
+      }
       
+      if (validUserIds.length === 0) {
+        throw new Error('No recordings found. Make sure videos were uploaded.');
       }
-        
-        if (validUserIds.length === 0) {
-          throw new Error('No recordings found');
-        }
-        
-        console.log(`✅ Processing ${validUserIds.length} user(s)`);
-        
-        const updatedRecording = await processRoom(roomId, validUserIds);
-        
-        io.to(roomId).emit('video-ready', {
-          downloadUrl: updatedRecording.videoUrl,
-          recordingId: updatedRecording.id
+      
+      console.log(`✅ Processing ${validUserIds.length} user(s)`);
+      
+      // 🎯 FIX: Pass recording.id instead of roomId
+      const updatedRecording = await processRoom(roomId, validUserIds, recording.id);
+      
+      io.to(roomId).emit('video-ready', {
+        downloadUrl: updatedRecording.videoUrl,
+        recordingId: updatedRecording.id
+      });
+      
+      console.log(`✅ Video processing complete`);
+      
+    } catch (error) {
+      console.error('❌ Video processing failed:', error);
+      
+      try {
+        // 🎯 FIX: Update using recording.id
+        await prisma.recording.update({
+          where: { id: recording.id },
+          data: { status: 'failed' }
         });
-        
-        console.log(`✅ Video processing complete`);
-        
-      } catch (error) {
-        console.error(' Video processing failed:', error);
-        
-        try {
-          await prisma.recording.update({
-            where: { roomId },
-            data: { status: 'failed' }
-          });
-        } catch (dbError) {
-          console.error(' Failed to update recording status:', dbError);
-        }
-        
-        io.to(roomId).emit('video-error', {
-          recordingId: recording?.id,
-          error: error.message
-        });
+      } catch (dbError) {
+        console.error('❌ Failed to update recording status:', dbError);
       }
-    }, 10000);
-  });
+      
+      io.to(roomId).emit('video-error', {
+        recordingId: recording?.id,
+        error: error.message
+      });
+    }
+  }, 15000);
+});
 
   socket.on('disconnect', () => {
     console.log(` Client disconnected: ${user.username} (${socket.id})`);
